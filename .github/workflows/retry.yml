@@ -1,0 +1,85 @@
+name: OCI Ampere VM Provisioner
+
+on:
+  schedule:
+    # Runs automatically every 30 minutes
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # Allows you to manually trigger with 1 click
+
+jobs:
+  hunt-capacity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OCI CLI
+        run: |
+          bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
+          echo "/home/runner/bin" >> $GITHUB_PATH
+
+      - name: Configure OCI Auth
+        env:
+          USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          REGION: ${{ secrets.OCI_REGION }}
+          KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
+        run: |
+          mkdir -p ~/.oci
+          echo "$KEY_CONTENT" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          
+          cat << EOF > ~/.oci/config
+          [DEFAULT]
+          user=${USER_OCID}
+          fingerprint=${FINGERPRINT}
+          key_file=~/.oci/oci_api_key.pem
+          tenancy=${TENANCY_OCID}
+          region=${REGION}
+          EOF
+          chmod 600 ~/.oci/config
+
+      - name: Auto-Retry VM Stack Apply
+        env:
+          STACK_ID: ${{ secrets.OCI_STACK_ID }}
+        run: |
+          echo "=========================================================="
+          echo "🚀 Starting 25-minute hunting cycle for thepurplepulsars-VM"
+          echo "Target Stack: $STACK_ID"
+          echo "=========================================================="
+          
+          END_TIME=$((SECONDS + 1500)) # Run loop for 25 minutes per workflow run
+          ATTEMPT=1
+          
+          while [ $SECONDS -lt $END_TIME ]; do
+            echo ""
+            echo "[$(date +'%Y-%m-%d %T')] 📡 Attempt #$ATTEMPT: Requesting Apply..."
+            JOB_ID=$(oci resource-manager job create-apply-job \
+              --stack-id "$STACK_ID" \
+              --execution-plan-strategy AUTO_APPROVED \
+              --query 'data.id' \
+              --raw-output 2>/dev/null || true)
+            
+            if [ -n "$JOB_ID" ] && [ "$JOB_ID" != "null" ]; then
+              echo "   📋 Job ID: $JOB_ID. Waiting for execution..."
+              STATUS="IN_PROGRESS"
+              while [ "$STATUS" = "ACCEPTED" ] || [ "$STATUS" = "IN_PROGRESS" ]; do
+                sleep 10
+                STATUS=$(oci resource-manager job get --job-id "$JOB_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null || true)
+              done
+              
+              if [ "$STATUS" = "SUCCEEDED" ]; then
+                echo ""
+                echo "🎉🎉🎉 SUCCESS! thepurplepulsars-VM has been created! 🎉🎉🎉"
+                exit 0
+              else
+                echo "   ❌ Slot occupied (Status: $STATUS). Capacity full."
+              fi
+            else
+              echo "   ⚠️ API cooldown or throttle. Backing off..."
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "   💤 Sleeping 2 minutes before next attempt..."
+            sleep 120
+          done
+          
+          echo "Cycle finished. GitHub Actions will trigger next run automatically."
