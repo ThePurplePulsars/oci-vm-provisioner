@@ -2,18 +2,22 @@ name: OCI Ampere VM Provisioner
 
 on:
   schedule:
-    # Runs automatically every 30 minutes
     - cron: '*/30 * * * *'
-  workflow_dispatch: # Allows you to manually trigger with 1 click
+  workflow_dispatch:
+
+# Prevents two runs from overlapping if GitHub delays a cron trigger
+concurrency:
+  group: oci-capacity-hunter
+  cancel-in-progress: false
 
 jobs:
   hunt-capacity:
     runs-on: ubuntu-latest
+    timeout-minutes: 28
     steps:
-      - name: Install OCI CLI
+      - name: Install OCI CLI (Fast)
         run: |
-          bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
-          echo "/home/runner/bin" >> $GITHUB_PATH
+          pip install --quiet oci-cli
 
       - name: Configure OCI Auth
         env:
@@ -24,7 +28,7 @@ jobs:
           KEY_CONTENT: ${{ secrets.OCI_KEY_FILE }}
         run: |
           mkdir -p ~/.oci
-          echo "$KEY_CONTENT" > ~/.oci/oci_api_key.pem
+          printf "%s\n" "$KEY_CONTENT" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
           
           cat << EOF > ~/.oci/config
@@ -36,30 +40,48 @@ jobs:
           region=${REGION}
           EOF
           chmod 600 ~/.oci/config
+          oci setup repair-file-permissions --file ~/.oci/config
+          oci setup repair-file-permissions --file ~/.oci/oci_api_key.pem
 
       - name: Auto-Retry VM Stack Apply
         env:
           STACK_ID: ${{ secrets.OCI_STACK_ID }}
+          TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
         run: |
+          # 1. Check if an Ampere A1 instance is already running/provisioning
+          EXISTING_VM=$(oci compute instance list \
+            --compartment-id "$TENANCY_OCID" \
+            --shape "VM.Standard.A1.Flex" \
+            --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].id | [0]" \
+            --raw-output 2>/dev/null || true)
+
+          if [ -n "$EXISTING_VM" ] && [ "$EXISTING_VM" != "null" ]; then
+            echo "✅ VM already exists (OCID: $EXISTING_VM)! Stopping hunter."
+            exit 0
+          fi
+
           echo "=========================================================="
-          echo "🚀 Starting 25-minute hunting cycle for thepurplepulsars-VM"
+          echo "🚀 Starting 24-minute hunting cycle for thepurplepulsars-VM"
           echo "Target Stack: $STACK_ID"
           echo "=========================================================="
           
-          END_TIME=$((SECONDS + 1500)) # Run loop for 25 minutes per workflow run
+          END_TIME=$((SECONDS + 1440)) # 24 minutes
           ATTEMPT=1
           
           while [ $SECONDS -lt $END_TIME ]; do
             echo ""
             echo "[$(date +'%Y-%m-%d %T')] 📡 Attempt #$ATTEMPT: Requesting Apply..."
-            JOB_ID=$(oci resource-manager job create-apply-job \
+            
+            # Capture stderr too in case Auth/Stack ID has an error
+            OUT=$(oci resource-manager job create-apply-job \
               --stack-id "$STACK_ID" \
               --execution-plan-strategy AUTO_APPROVED \
               --query 'data.id' \
-              --raw-output 2>/dev/null || true)
+              --raw-output 2>&1 || true)
             
-            if [ -n "$JOB_ID" ] && [ "$JOB_ID" != "null" ]; then
-              echo "   📋 Job ID: $JOB_ID. Waiting for execution..."
+            if [[ "$OUT" == ocid1.ormjob.* ]]; then
+              JOB_ID="$OUT"
+              echo "   📋 Job ID: $JOB_ID. Waiting for Terraform execution..."
               STATUS="IN_PROGRESS"
               while [ "$STATUS" = "ACCEPTED" ] || [ "$STATUS" = "IN_PROGRESS" ]; do
                 sleep 10
@@ -71,15 +93,15 @@ jobs:
                 echo "🎉🎉🎉 SUCCESS! thepurplepulsars-VM has been created! 🎉🎉🎉"
                 exit 0
               else
-                echo "   ❌ Slot occupied (Status: $STATUS). Capacity full."
+                echo "   ❌ Job finished with status: $STATUS (Out of host capacity)."
               fi
             else
-              echo "   ⚠️ API cooldown or throttle. Backing off..."
+              echo "   ⚠️ Could not trigger job. Output: $OUT"
             fi
             
             ATTEMPT=$((ATTEMPT + 1))
-            echo "   💤 Sleeping 2 minutes before next attempt..."
-            sleep 120
+            echo "   💤 Sleeping 90 seconds before next attempt..."
+            sleep 90
           done
           
-          echo "Cycle finished. GitHub Actions will trigger next run automatically."
+          echo "Cycle finished. Waiting for next scheduled workflow run."
