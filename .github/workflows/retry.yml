@@ -48,15 +48,14 @@ jobs:
           STACK_ID: ${{ secrets.OCI_STACK_ID }}
           TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
         run: |
-          # 1. Check if an Ampere A1 instance is already running/provisioning
+          # 1. Safely check if any active instance exists in the compartment
           EXISTING_VM=$(oci compute instance list \
             --compartment-id "$TENANCY_OCID" \
-            --shape "VM.Standard.A1.Flex" \
             --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].id | [0]" \
             --raw-output 2>/dev/null || true)
 
           if [ -n "$EXISTING_VM" ] && [ "$EXISTING_VM" != "null" ]; then
-            echo "✅ VM already exists (OCID: $EXISTING_VM)! Stopping hunter."
+            echo "✅ Active VM already exists (OCID: $EXISTING_VM)! Stopping hunter."
             exit 0
           fi
 
@@ -72,7 +71,6 @@ jobs:
             echo ""
             echo "[$(date +'%Y-%m-%d %T')] 📡 Attempt #$ATTEMPT: Requesting Apply..."
             
-            # Capture stderr too in case Auth/Stack ID has an error
             OUT=$(oci resource-manager job create-apply-job \
               --stack-id "$STACK_ID" \
               --execution-plan-strategy AUTO_APPROVED \
